@@ -3,6 +3,7 @@ import json
 import os
 import uuid
 import tempfile
+import re
 from io import BytesIO
 from datetime import datetime
 from PIL import Image
@@ -46,21 +47,24 @@ def extract_text_with_document_intelligence(image_path: str) -> str:
         data = f.read()
     poller = client.begin_analyze_document("prebuilt-read", body=data)
     result = poller.result()
-    paragraphs = [p.content for p in result.paragraphs]
-    return "\n".join(paragraphs)
+    return "\n".join(p.content for p in result.paragraphs)
 
-
-def chat_completion(messages: list, max_tokens: int = 1500, temperature: float = 0.7) -> dict:
-    url = f"{GPT_ENDPOINT}/openai/deployments/{GPT_DEPLOYMENT}/chat/completions?api-version={GPT_API_VERSION}"
+def chat_completion(messages: list, max_tokens: int = 1500, temperature: float = 0.7) -> str:
+    url = (
+        f"{GPT_ENDPOINT}/openai/deployments/{GPT_DEPLOYMENT}"
+        f"/chat/completions?api-version={GPT_API_VERSION}"
+    )
     headers = {"Content-Type": "application/json", "api-key": GPT_KEY}
     payload = {"messages": messages, "max_tokens": max_tokens, "temperature": temperature}
     res = requests.post(url, headers=headers, json=payload)
     res.raise_for_status()
     return res.json()["choices"][0]["message"]["content"]
 
-
 def generate_story(document_text: str) -> dict:
-    system = "You are a teaching assistant... (use the JSON schema for storytitle, s2paragraph1... s6alt1)"
+    system = (
+        "You are a teaching assistant. "
+        "Create a JSON with keys: storytitle, s2paragraph1…s6paragraph1, and s1alt1…s6alt1."
+    )
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": document_text}
@@ -68,14 +72,34 @@ def generate_story(document_text: str) -> dict:
     content = chat_completion(messages)
     return json.loads(content)
 
-
 def generate_seo(data: dict) -> dict:
-    prompt = f"Generate SEO metadata... Title: {data['storytitle']} Slides: - {data['s2paragraph1']} ..."
-    messages = [{"role": "system", "content": "You are an expert SEO assistant."},
-                {"role": "user", "content": prompt}]
+    prompt = (
+        "Generate SEO metadata *strictly* as JSON. "
+        "Wrap your answer in ```json ... ``` with no extra text.\n\n"
+        f"Title: {data['storytitle']}\n"
+        "Slides:\n"
+        f"- {data['s2paragraph1']}\n"
+        f"- {data['s3paragraph1']}\n"
+        f"- {data['s4paragraph1']}\n"
+        f"- {data['s5paragraph1']}\n"
+        f"- {data['s6paragraph1']}\n"
+        "Return keys: metadescription, metakeywords."
+    )
+    messages = [
+        {"role": "system", "content": "You are an expert SEO assistant."},
+        {"role": "user",   "content": prompt}
+    ]
     content = chat_completion(messages, max_tokens=300, temperature=0.5)
-    return json.loads(content)
 
+    # strip markdown fences if present
+    m = re.search(r"```json(.*?)```", content, re.S)
+    raw = m.group(1).strip() if m else content.strip()
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        st.warning("⚠️ SEO JSON parse failed; using empty metadata.")
+        return {"metadescription": "", "metakeywords": ""}
 
 def generate_images_and_upload(data: dict) -> dict:
     s3 = boto3.client(
@@ -98,13 +122,13 @@ def generate_images_and_upload(data: dict) -> dict:
         key = f"{S3_PREFIX}/{slug}/slide{i}.jpg"
         s3.upload_fileobj(buf, AWS_BUCKET, key)
         data[f"s{i}image1"] = f"{CDN_BASE}{key}"
+
     # portrait cover
     cover_key = f"{S3_PREFIX}/{slug}/portrait_cover.jpg"
     buf = BytesIO(); img.save(buf, "JPEG"); buf.seek(0)
     s3.upload_fileobj(buf, AWS_BUCKET, cover_key)
     data["portraitcoverurl"] = f"{CDN_BASE}{cover_key}"
     return data
-
 
 def synthesize_and_upload_audio(data: dict) -> dict:
     s3 = boto3.client(
@@ -115,25 +139,28 @@ def synthesize_and_upload_audio(data: dict) -> dict:
     )
     speech_config = speechsdk.SpeechConfig(subscription=AZURE_SPEECH_KEY, region=AZURE_REGION)
     speech_config.speech_synthesis_voice_name = VOICE_NAME
+
     for field, audio_key in {
         "storytitle": "s1audio1", "s2paragraph1": "s2audio1",
         "s3paragraph1": "s3audio1", "s4paragraph1": "s4audio1",
         "s5paragraph1": "s5audio1", "s6paragraph1": "s6audio1"
     }.items():
         text = data.get(field)
-        if not text: continue
-        uuid_fn = f"{uuid.uuid4().hex}.mp3"
-        audio_config = speechsdk.audio.AudioOutputConfig(filename=uuid_fn)
+        if not text:
+            continue
+        fn = f"{uuid.uuid4().hex}.mp3"
+        audio_config = speechsdk.audio.AudioOutputConfig(filename=fn)
         synthesizer = speechsdk.SpeechSynthesizer(speech_config, audio_config)
         synthesizer.speak_text_async(text).get()
-        key = f"{S3_PREFIX}/audio/{uuid_fn}"
-        s3.upload_file(uuid_fn, AWS_BUCKET, key)
+        key = f"{S3_PREFIX}/audio/{fn}"
+        s3.upload_file(fn, AWS_BUCKET, key)
         data[audio_key] = f"{CDN_BASE}{key}"
+
     return data
 
-
 def fill_template(template: str, data: dict) -> str:
-    for k, v in data.items(): template = template.replace(f"{{{{{k}}}}}", v)
+    for k, v in data.items():
+        template = template.replace(f"{{{{{k}}}}}", v)
     return template
 
 # -------------------------------
@@ -142,13 +169,14 @@ def fill_template(template: str, data: dict) -> str:
 st.set_page_config(page_title="Notes → Web Story", layout="centered")
 st.title("Lecture Notes → AMP Web Story Generator")
 
-uploaded_file = st.file_uploader("Upload your notes image:", type=["png", "jpg", "jpeg"])
-if not uploaded_file:
+uploaded = st.file_uploader("Upload your notes image:", type=["png", "jpg", "jpeg"])
+if not uploaded:
     st.info("Please upload an image to get started.")
     st.stop()
 
+# save temp file
 with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
-    tmp.write(uploaded_file.read())
+    tmp.write(uploaded.read())
     img_path = tmp.name
 
 st.image(img_path, caption="Uploaded Notes", use_column_width=True)
@@ -167,22 +195,22 @@ with st.spinner("Creating SEO metadata…"):
 st.success("SEO metadata added!")
 
 with st.spinner("Generating and uploading images…"):
-    data_with_images = generate_images_and_upload(story)
+    story = generate_images_and_upload(story)
 st.success("Images uploaded!")
 
 with st.spinner("Synthesizing and uploading audio…"):
-    full_data = synthesize_and_upload_audio(data_with_images)
+    story = synthesize_and_upload_audio(story)
 st.success("Audio uploaded!")
 
+# fill and deliver HTML
 with open(HTML_TEMPLATE, "r", encoding="utf-8") as f:
-    template = f.read()
-final_html = fill_template(template, full_data)
+    tpl = f.read()
+final_html = fill_template(tpl, story)
 
-# Download button
 st.download_button(
     label="Download HTML Web Story",
     data=final_html,
-    file_name=f"{full_data['storytitle'].lower().replace(' ', '_')}.html",
+    file_name=f"{story['storytitle'].lower().replace(' ', '_')}.html",
     mime="text/html"
 )
 
