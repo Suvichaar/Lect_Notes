@@ -1,0 +1,6 @@
+streamlit
+azure-ai-documentintelligence
+azure-cognitiveservices-speech
+boto3
+Pillow
+requests
