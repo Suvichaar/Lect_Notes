@@ -33,6 +33,7 @@ AWS_REGION        = st.secrets.get("AWS_REGION", "ap-south-1")
 AWS_BUCKET        = st.secrets["AWS_BUCKET"]
 S3_PREFIX         = st.secrets.get("S3_PREFIX", "media/")
 CDN_BASE          = st.secrets.get("CDN_BASE", "https://media.suvichaar.org/")
+DEFAULT_ERROR_IMAGE = st.secrets.get("DEFAULT_ERROR_IMAGE", "https://media.suvichaar.org/default-error.jpg")
 HTML_TEMPLATE     = "template-v18.html"  # Place this file in the app folder
 
 # -------------------------------
@@ -109,25 +110,46 @@ def generate_images_and_upload(data: dict) -> dict:
         region_name=AWS_REGION
     )
     slug = data["storytitle"].lower().replace(" ", "-").replace(":", "")
+
     for i in range(1, 7):
         prompt = data.get(f"s{i}alt1", "")
-        headers = {"Content-Type": "application/json", "api-key": DALE_KEY}
-        payload = {"prompt": prompt, "n": 1, "size": "1024x1024"}
-        dr = requests.post(DALE_ENDPOINT, headers=headers, json=payload)
-        dr.raise_for_status()
-        img_url = dr.json()["data"][0]["url"]
-        img_data = requests.get(img_url).content
-        img = Image.open(BytesIO(img_data)).convert("RGB").resize((720, 1200))
-        buf = BytesIO(); img.save(buf, "JPEG"); buf.seek(0)
+        try:
+            # Attempt DALL·E generation
+            headers = {"Content-Type":"application/json", "api-key": DALE_KEY}
+            payload = {"prompt": prompt, "n": 1, "size": "1024x1024"}
+            dr = requests.post(DALE_ENDPOINT, headers=headers, json=payload)
+            dr.raise_for_status()
+            img_url = dr.json()["data"][0]["url"]
+
+            # Download and resize
+            img_data = requests.get(img_url).content
+            img = Image.open(BytesIO(img_data)).convert("RGB").resize((720,1200))
+        except Exception as e:
+            st.error(f"Image gen failed for slide {i}: {e}")
+            # Fallback to default error image
+            img = Image.open(requests.get(DEFAULT_ERROR_IMAGE).raw).convert("RGB").resize((720,1200))
+
+        # Upload to S3
+        buf = BytesIO()
+        img.save(buf, "JPEG")
+        buf.seek(0)
         key = f"{S3_PREFIX}/{slug}/slide{i}.jpg"
         s3.upload_fileobj(buf, AWS_BUCKET, key)
         data[f"s{i}image1"] = f"{CDN_BASE}{key}"
 
-    # portrait cover
+    # Portrait cover (reuse last img)
+    try:
+        cover_img = img
+    except NameError:
+        cover_img = Image.open(requests.get(DEFAULT_ERROR_IMAGE).raw).convert("RGB").resize((640,853))
+
+    buf = BytesIO()
+    cover_img.save(buf, "JPEG")
+    buf.seek(0)
     cover_key = f"{S3_PREFIX}/{slug}/portrait_cover.jpg"
-    buf = BytesIO(); img.save(buf, "JPEG"); buf.seek(0)
     s3.upload_fileobj(buf, AWS_BUCKET, cover_key)
     data["portraitcoverurl"] = f"{CDN_BASE}{cover_key}"
+
     return data
 
 def synthesize_and_upload_audio(data: dict) -> dict:
@@ -174,7 +196,7 @@ if not uploaded:
     st.info("Please upload an image to get started.")
     st.stop()
 
-# save temp file
+# Save temporary image file
 with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
     tmp.write(uploaded.read())
     img_path = tmp.name
@@ -182,7 +204,7 @@ with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
 st.image(img_path, caption="Uploaded Notes", use_column_width=True)
 
 with st.spinner("Extracting text…"):
-    text = extract_text_with_document_intelligence(img_path)
+    text = extract_text_with_documentintelligence(img_path)
 st.success("Text extracted!")
 
 with st.spinner("Generating story & prompts…"):
@@ -199,10 +221,10 @@ with st.spinner("Generating and uploading images…"):
 st.success("Images uploaded!")
 
 with st.spinner("Synthesizing and uploading audio…"):
-    story = synthesize_and_upload_audio(story)
+    story = synthesize_anduploadaudio(story)
 st.success("Audio uploaded!")
 
-# fill and deliver HTML
+# Fill HTML template and provide download
 with open(HTML_TEMPLATE, "r", encoding="utf-8") as f:
     tpl = f.read()
 final_html = fill_template(tpl, story)
