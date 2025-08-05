@@ -114,22 +114,17 @@ def generate_images_and_upload(data: dict) -> dict:
     for i in range(1, 7):
         prompt = data.get(f"s{i}alt1", "")
         try:
-            # Attempt DALL·E generation
             headers = {"Content-Type":"application/json", "api-key": DALE_KEY}
             payload = {"prompt": prompt, "n": 1, "size": "1024x1024"}
             dr = requests.post(DALE_ENDPOINT, headers=headers, json=payload)
             dr.raise_for_status()
             img_url = dr.json()["data"][0]["url"]
-
-            # Download and resize
             img_data = requests.get(img_url).content
             img = Image.open(BytesIO(img_data)).convert("RGB").resize((720,1200))
         except Exception as e:
             st.error(f"Image gen failed for slide {i}: {e}")
-            # Fallback to default error image
             img = Image.open(requests.get(DEFAULT_ERROR_IMAGE).raw).convert("RGB").resize((720,1200))
 
-        # Upload to S3
         buf = BytesIO()
         img.save(buf, "JPEG")
         buf.seek(0)
@@ -137,7 +132,6 @@ def generate_images_and_upload(data: dict) -> dict:
         s3.upload_fileobj(buf, AWS_BUCKET, key)
         data[f"s{i}image1"] = f"{CDN_BASE}{key}"
 
-    # Portrait cover (reuse last img)
     try:
         cover_img = img
     except NameError:
@@ -189,51 +183,3 @@ def fill_template(template: str, data: dict) -> str:
 # Streamlit UI
 # -------------------------------
 st.set_page_config(page_title="Notes → Web Story", layout="centered")
-st.title("Lecture Notes → AMP Web Story Generator")
-
-uploaded = st.file_uploader("Upload your notes image:", type=["png", "jpg", "jpeg"])
-if not uploaded:
-    st.info("Please upload an image to get started.")
-    st.stop()
-
-# Save temporary image file
-with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
-    tmp.write(uploaded.read())
-    img_path = tmp.name
-
-st.image(img_path, caption="Uploaded Notes", use_column_width=True)
-
-with st.spinner("Extracting text…"):
-    text = extract_text_with_documentintelligence(img_path)
-st.success("Text extracted!")
-
-with st.spinner("Generating story & prompts…"):
-    story = generate_story(text)
-st.success("Story generated!")
-
-with st.spinner("Creating SEO metadata…"):
-    seo = generate_seo(story)
-    story.update(seo)
-st.success("SEO metadata added!")
-
-with st.spinner("Generating and uploading images…"):
-    story = generate_images_and_upload(story)
-st.success("Images uploaded!")
-
-with st.spinner("Synthesizing and uploading audio…"):
-    story = synthesize_anduploadaudio(story)
-st.success("Audio uploaded!")
-
-# Fill HTML template and provide download
-with open(HTML_TEMPLATE, "r", encoding="utf-8") as f:
-    tpl = f.read()
-final_html = fill_template(tpl, story)
-
-st.download_button(
-    label="Download HTML Web Story",
-    data=final_html,
-    file_name=f"{story['storytitle'].lower().replace(' ', '_')}.html",
-    mime="text/html"
-)
-
-st.balloons()
